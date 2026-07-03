@@ -87,7 +87,12 @@ private val SheetSpec = tween<Float>(340, easing = SheetEasing)
 // and that slow tail was the "тянется как тугая резина / подлагивает" feel. The
 // spring picks up the release velocity so a light flick glides the sheet
 // open/closed immediately.
-private val SheetSettleSpring = spring<Float>(dampingRatio = 0.86f, stiffness = 340f)
+// Critically damped (dampingRatio = 1f) → NO overshoot/bounce at the end of the
+// open. When it was underdamped (0.86) the spring sailed past the target and
+// oscillated back — that end-of-open wobble was the "под конец открытия дрожит /
+// дёргано" the user reported. It still picks up the finger's release velocity so
+// a light flick glides it home.
+private val SheetSettleSpring = spring<Float>(dampingRatio = 1f, stiffness = 300f)
 
 // Commands funnelled through the single sheet-progress consumer (the
 // LaunchedEffect in AnketnicaApp). Snap = follow the finger; Settle = animate to
@@ -180,6 +185,11 @@ fun AnketnicaApp(state: AnketnicaState) {
     val sheetCommands = remember { Channel<SheetCommand>(Channel.CONFLATED) }
     var sheetSettling by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
+        // Clamp progress to [0,1] so a velocity-seeded settle can never overshoot
+        // past the top and spring back down — a second guard against the
+        // end-of-open jitter. With bounds set, the settle simply stops dead at
+        // 0f / 1f even if the throw velocity would have carried it further.
+        sheetProgress.updateBounds(0f, 1f)
         for (cmd in sheetCommands) {
             when (cmd) {
                 is SheetCommand.Snap -> sheetProgress.snapTo(cmd.target)
