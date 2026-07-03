@@ -1,10 +1,12 @@
 package com.letify.app.ui.components
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -51,10 +53,14 @@ fun SettingsRow(
         .let { if (onClick != null) it.noFeedbackClick(onClick = onClick) else it }
         .padding(horizontal = 12.dp, vertical = 8.dp)
     Row(rowModifier, verticalAlignment = Alignment.CenterVertically) {
-        // Telegram-style tile: vivid base with a subtle vertical sheen.
-        // NO border/outline (per design: no hairline rims on any element).
-        val tileTop = lerp(iconTile, Color.White, 0.18f)
-        val tileBottom = lerp(iconTile, Color.Black, 0.13f)
+        // Glassy "frosted" tile (подложка taken from the reference build): a
+        // vivid base gradient kept LIGHT at the bottom — the old lerp-to-black
+        // 0.13 made the tiles look muddy / "слишком тёмный", so it is dialled to
+        // 0.04 — plus a translucent white gloss over the TOP half (the
+        // "полупрозрачная водичка сверху") and a crisp 1px top rim, so light reads
+        // as catching the top edge of a piece of glass rather than a flat chip.
+        val tileTop = lerp(iconTile, Color.White, 0.22f)
+        val tileBottom = lerp(iconTile, Color.Black, 0.04f)
         val tileShape = RoundedCornerShape(11.dp)
         Box(
             Modifier
@@ -66,9 +72,31 @@ fun SettingsRow(
                         0.34f to iconTile,
                         1f to tileBottom,
                     ),
+                )
+                .border(
+                    width = 1.dp,
+                    brush = Brush.verticalGradient(
+                        0f to Color.White.copy(alpha = 0.5f),
+                        0.55f to Color.Transparent,
+                    ),
+                    shape = tileShape,
                 ),
             contentAlignment = Alignment.Center,
         ) {
+            // Translucent glass gloss over the top half — sits above the base
+            // gradient, below the icon.
+            Box(
+                Modifier
+                    .align(Alignment.TopCenter)
+                    .fillMaxWidth()
+                    .fillMaxHeight(0.5f)
+                    .background(
+                        Brush.verticalGradient(
+                            0f to Color.White.copy(alpha = 0.38f),
+                            1f to Color.White.copy(alpha = 0f),
+                        ),
+                    ),
+            )
             SolarIcon(name = icon, tint = iconTint, size = 20.dp)
         }
         Box(Modifier.width(14.dp))

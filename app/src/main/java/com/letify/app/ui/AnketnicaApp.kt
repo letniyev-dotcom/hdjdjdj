@@ -5,6 +5,7 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.AnimationVector1D
 import androidx.compose.animation.core.CubicBezierEasing
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -55,6 +56,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.Velocity
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -78,6 +80,22 @@ import kotlinx.coroutines.launch
 // push (LetifyOverlay.PushEasing) so the whole app moves on one feel.
 private val SheetEasing = CubicBezierEasing(0.32f, 0.72f, 0.0f, 1.0f)
 private val SheetSpec = tween<Float>(340, easing = SheetEasing)
+
+// Drag-release settle now rides a spring seeded with the finger's own velocity
+// (see sheetOnDragEnd) instead of a fixed tween — a tween ignored the throw
+// velocity and always spent its full 340ms easing curve decelerating to rest,
+// and that slow tail was the "тянется как тугая резина / подлагивает" feel. The
+// spring picks up the release velocity so a light flick glides the sheet
+// open/closed immediately.
+private val SheetSettleSpring = spring<Float>(dampingRatio = 0.86f, stiffness = 340f)
+
+// Commands funnelled through the single sheet-progress consumer (the
+// LaunchedEffect in AnketnicaApp). Snap = follow the finger; Settle = animate to
+// a resting 0/1 carrying the release velocity.
+private sealed interface SheetCommand {
+    data class Snap(val target: Float) : SheetCommand
+    data class Settle(val target: Float, val velocity: Float) : SheetCommand
+}
 
 // The in-sheet push-in (RoundedSlideOverlay) takes ~360ms + 2 warm-up frames.
 // The sheet only climbs to fullscreen AFTER that, so opening an anketa reads as
@@ -145,57 +163,74 @@ fun AnketnicaApp(state: AnketnicaState) {
     // animation mid-flight — that was the "лист дёргается / улетает / пропадает"
     // when flinging the sheet down. We cancel the previous mutation before every
     // new one so only the latest ever wins.
-    var sheetDragJob by remember { mutableStateOf<Job?>(null) }
-    // TRUE while the release settle animation is running. The list's native fling
-    // keeps delivering momentum frames through nested-scroll AFTER the finger has
-    // lifted (and after onDragEnd already started the settle). Those trailing
-    // deltas used to call onDrag → cancel the settle mid-flight → the sheet
-    // "улетает / дрожит / пропадает". While settling we swallow every incoming
-    // drag delta so nothing can interrupt the settle. The settle is only ~340ms,
-    // so this is imperceptible for a deliberate re-grab.
+    // The sheet had two long-standing feel bugs, both fixed by funnelling EVERY
+    // mutation of sheetProgress through ONE long-lived consumer coroutine fed by
+    // a CONFLATED channel:
+    //  1. "подлагивает" — the old onDrag launched (and cancelled) a brand-new
+    //     coroutine calling snapTo on EVERY drag frame; that per-frame
+    //     launch/cancel storm churned the mutator-mutex and micro-stuttered the
+    //     sheet. Now onDrag just trySends the latest target and the consumer
+    //     snaps to it — no per-frame coroutines.
+    //  2. "тянется, потом возвращается / улетает" — the release animateTo used to
+    //     race with still-queued drag snapTo calls through the mutator-mutex and
+    //     got cancelled mid-flight. The consumer processes one command at a time
+    //     and the channel is CONFLATED, so while a settle's animateTo suspends the
+    //     loop any late Snap is simply overwritten in the 1-slot buffer and can
+    //     never interrupt the settle.
+    val sheetCommands = remember { Channel<SheetCommand>(Channel.CONFLATED) }
     var sheetSettling by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        for (cmd in sheetCommands) {
+            when (cmd) {
+                is SheetCommand.Snap -> sheetProgress.snapTo(cmd.target)
+                is SheetCommand.Settle -> {
+                    sheetSettling = true
+                    try {
+                        sheetProgress.animateTo(
+                            cmd.target,
+                            SheetSettleSpring,
+                            initialVelocity = cmd.velocity,
+                        )
+                    } finally {
+                        sheetSettling = false
+                    }
+                }
+            }
+        }
+    }
     val sheetOnDrag: (Float) -> Unit = { dyPx ->
+        // Swallow drag deltas while a release settle animates — trailing fling
+        // frames must not re-drive the sheet mid-settle.
         if (!sheetSettling) {
-            // Compute travel LIVE from rootHeightPx. The gesture handlers that
-            // call this — the grabber's pointerInput(Unit), the profile's
-            // pointerInput(Unit), and the list's nestedScroll remember(interactive)
-            // — all capture THIS lambda at first composition, when rootHeightPx
-            // was still 0 and a captured `travelPx` stayed pinned at its 1px floor
-            // forever. Dividing a drag delta by 1px flung sheetProgress across the
-            // whole 0..1 range on the tiniest finger move — exactly the
-            // "резко пропадает / появляется / взлетает / падает" chaos when
-            // dragging by the list (the grabber hid it because onDragEnd always
-            // settles to a clean 0/1). Reading rootHeightPx (a live snapshot
-            // state) here means even a stale-captured lambda uses the real,
-            // post-measure travel, so the drag tracks the finger 1:1 again.
+            // Travel is read LIVE from rootHeightPx: a lambda captured at first
+            // composition otherwise pins travel at its 1px floor and flings
+            // progress across 0..1 on the tiniest move.
             val tp = (rootHeightPx - peekPx - topGapPx).coerceAtLeast(1f)
             val next = (sheetProgress.value - dyPx / tp).coerceIn(0f, 1f)
-            sheetDragJob?.cancel()
-            sheetDragJob = scope.launch { sheetProgress.snapTo(next) }
+            sheetCommands.trySend(SheetCommand.Snap(next))
         }
     }
     val sheetOnDragEnd: (Float) -> Unit = { vy ->
-        // Kill any pending drag snapTo so it can't run after (and cancel) the
-        // settle animation below, then lock out further drags until it finishes.
-        sheetDragJob?.cancel()
-        val target = when {
-            vy < -700f -> 1f
-            vy > 700f -> 0f
-            else -> if (sheetProgress.value > 0.4f) 1f else 0f
-        }
+        // vy = the finger's throw velocity in px/s. A GENTLE flick now commits
+        // (was ±700 px/s — that high bar is exactly why opening "требовал слишком
+        // долгий свайп"); un-thrown, the sheet commits from just past 30% travel
+        // instead of 40%. Lock out drags until the settle finishes so a trailing
+        // fling frame can't reopen it.
         sheetSettling = true
-        sheetDragJob = scope.launch {
-            try {
-                sheetProgress.animateTo(target, SheetSpec)
-            } finally {
-                sheetSettling = false
-            }
+        val tp = (rootHeightPx - peekPx - topGapPx).coerceAtLeast(1f)
+        val target = when {
+            vy < -320f -> 1f
+            vy > 320f -> 0f
+            else -> if (sheetProgress.value > 0.3f) 1f else 0f
         }
+        // px/s → progress-units/s (progress grows as the finger moves UP, i.e. as
+        // dy goes negative) so the spring continues the throw seamlessly.
+        sheetCommands.trySend(SheetCommand.Settle(target, -vy / tp))
     }
 
     val sheetExpanded by remember { derivedStateOf { sheetProgress.value > 0.5f } }
     BackHandler(enabled = sheetExpanded && detailId == null && subStack.isEmpty()) {
-        scope.launch { sheetProgress.animateTo(0f, SheetSpec) }
+        sheetCommands.trySend(SheetCommand.Settle(0f, 0f))
     }
     val onHome = subStack.isEmpty()
     LaunchedEffect(onHome) {
@@ -329,10 +364,8 @@ fun AnketnicaApp(state: AnketnicaState) {
             interactive = subStack.isEmpty(),
             onOpenAnketa = openAnketa,
             onToggle = {
-                scope.launch {
-                    val target = if (sheetProgress.value < 0.5f) 1f else 0f
-                    sheetProgress.animateTo(target, SheetSpec)
-                }
+                val target = if (sheetProgress.value < 0.5f) 1f else 0f
+                sheetCommands.trySend(SheetCommand.Settle(target, 0f))
             },
             onDrag = sheetOnDrag,
             onDragEnd = sheetOnDragEnd,
