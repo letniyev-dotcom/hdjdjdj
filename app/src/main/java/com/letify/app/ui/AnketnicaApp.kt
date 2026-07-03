@@ -156,7 +156,20 @@ fun AnketnicaApp(state: AnketnicaState) {
     var sheetSettling by remember { mutableStateOf(false) }
     val sheetOnDrag: (Float) -> Unit = { dyPx ->
         if (!sheetSettling) {
-            val next = (sheetProgress.value - dyPx / travelPx).coerceIn(0f, 1f)
+            // Compute travel LIVE from rootHeightPx. The gesture handlers that
+            // call this — the grabber's pointerInput(Unit), the profile's
+            // pointerInput(Unit), and the list's nestedScroll remember(interactive)
+            // — all capture THIS lambda at first composition, when rootHeightPx
+            // was still 0 and a captured `travelPx` stayed pinned at its 1px floor
+            // forever. Dividing a drag delta by 1px flung sheetProgress across the
+            // whole 0..1 range on the tiniest finger move — exactly the
+            // "резко пропадает / появляется / взлетает / падает" chaos when
+            // dragging by the list (the grabber hid it because onDragEnd always
+            // settles to a clean 0/1). Reading rootHeightPx (a live snapshot
+            // state) here means even a stale-captured lambda uses the real,
+            // post-measure travel, so the drag tracks the finger 1:1 again.
+            val tp = (rootHeightPx - peekPx - topGapPx).coerceAtLeast(1f)
+            val next = (sheetProgress.value - dyPx / tp).coerceIn(0f, 1f)
             sheetDragJob?.cancel()
             sheetDragJob = scope.launch { sheetProgress.snapTo(next) }
         }
@@ -424,13 +437,18 @@ private fun NewAnketySheet(
         val sheetNsc = remember(interactive) {
             object : NestedScrollConnection {
                 override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
-                    if (interactive && available.y < 0f && progress.value < 1f) {
+                    // Only a USER DRAG (not fling momentum) moves the sheet here.
+                    // The list's post-release fling keeps delivering scroll frames
+                    // through nested-scroll; if those also drove the sheet they
+                    // fought the settle animation and made it jitter/"улетать".
+                    // Fling is handled cleanly in onPreFling/onPostFling → onDragEnd.
+                    if (interactive && source == NestedScrollSource.Drag && available.y < 0f && progress.value < 1f) {
                         onDrag(available.y); return available
                     }
                     return Offset.Zero
                 }
                 override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
-                    if (interactive && available.y > 0f && progress.value > 0f) {
+                    if (interactive && source == NestedScrollSource.Drag && available.y > 0f && progress.value > 0f) {
                         onDrag(available.y); return available
                     }
                     return Offset.Zero
